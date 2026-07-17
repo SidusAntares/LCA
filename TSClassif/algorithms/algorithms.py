@@ -20,20 +20,23 @@ def get_algorithm_class(algorithm_name):
 
 class LCA(torch.nn.Module):
 
-    def __init__(self, model_config, configs, hparams, device):
+    def __init__(self, model_config, configs, hparams, device, policy):
         super(LCA, self).__init__()
         config = merge_args(configs, model_config)
 
         self.hparams = hparams
         self.config = config
         self.device = device
+        self.policy = policy
         self.cross_entropy = nn.CrossEntropyLoss()
         self.d_std = 0.1
         config.z_dim = configs.input_channels
         new_configs = deepcopy(configs)
         new_configs.input_channels = config.z_dim
         self.feature_extractor = CNN(new_configs)
-        self.classifier = classifier(new_configs)
+        self.classifier = classifier(
+            new_configs, output_type=policy.classifier_output_type
+        )
         self.rec_criterion = nn.MSELoss()
 
         self.z_net = Base_Net(input_len=config.sequence_len, out_len=config.sequence_len,
@@ -67,35 +70,36 @@ class LCA(torch.nn.Module):
             lr=config.lr,
             weight_decay=1e-4
         )
+        self.capture_batch_audit = False
+        self.last_batch_audit = None
 
-    def update(self, src_loader, trg_loader, avg_meter, logger, value_method,
-               training_protocol):
+    def update(self, src_loader, trg_loader, avg_meter, logger, value_method):
         # defining best and last model
         best_src_risk = float('inf')
         best_model = None
         best_epoch = None
+        self.epoch_mode_trace = []
 
         for epoch in range(1, self.hparams["num_epochs"] + 1):
-            if training_protocol == "baseline_clean_protocol":
-                self.train()
+            self.policy.begin_epoch(self, avg_meter)
+            self.epoch_mode_trace.append(self._mode_record(epoch))
 
             # training loop
             self.training_epoch(src_loader, trg_loader, avg_meter, epoch)
 
             # saving the best model based on src risk
-            if (epoch + 1) % 10 == 0 and avg_meter['Src_cls_loss'].avg < best_src_risk:
-                best_src_risk = avg_meter['Src_cls_loss'].avg
+            eligible, candidate = self.policy.checkpoint_candidate(epoch, avg_meter)
+            if eligible and candidate < best_src_risk:
+                best_src_risk = candidate
                 best_model = deepcopy(self.state_dict())
                 best_epoch = epoch
 
             logger.debug(f'[Epoch : {epoch}/{self.hparams["num_epochs"]}]')
             for key, val in avg_meter.items():
                 logger.debug(f'{key}\t: {val.avg:2.4f}')
-            if training_protocol == "paper_code_protocol":
+            if self.policy.evaluate_target_during_training:
                 metric = value_method(is_train=False)[1]
                 logger.debug(f'trg_value f1 is {metric}')
-            elif training_protocol != "baseline_clean_protocol":
-                raise ValueError(f"unknown training protocol: {training_protocol}")
             logger.debug(f'-------------------------------------')
 
         last_model = self.state_dict()
@@ -103,6 +107,16 @@ class LCA(torch.nn.Module):
         self.last_epoch = self.hparams["num_epochs"]
 
         return last_model, best_model
+
+    def _mode_record(self, epoch):
+        batch_norm = [m.training for m in self.modules() if isinstance(m, nn.BatchNorm1d)]
+        dropout = [m.training for m in self.modules() if isinstance(m, nn.Dropout)]
+        return {
+            "epoch": epoch,
+            "model_training": self.training,
+            "batchnorm_training": all(batch_norm) if batch_norm else None,
+            "dropout_training": all(dropout) if dropout else None,
+        }
 
     def training_epoch(self, src_loader, trg_loader, avg_meter, epoch):
 
@@ -115,7 +129,7 @@ class LCA(torch.nn.Module):
 
             (src_z_mean, src_z_std, src_z), src_rec, src_pred_class = self.get_features(src_x)
             (tgt_z_mean, tgt_z_std, tgt_z), tgt_rec, tgt_pred_class = self.get_features(trg_x)
-            class_loss, rec_loss, sparsity_loss, kld_loss, structure_loss \
+            class_loss, source_loss, pseudo_loss, rec_loss, sparsity_loss, kld_loss, structure_loss \
                 = self.__loss_function(src_z_mean, src_z_std, src_z, src_x, src_rec, src_pred_class,
                                        tgt_z_mean, tgt_z_std, tgt_z, trg_x, tgt_rec, tgt_pred_class, src_y,
                                        epoch, no_kl=self.config.No_prior)
@@ -126,6 +140,8 @@ class LCA(torch.nn.Module):
                     class_loss * self.config.class_weight + rec_loss * self.config.rec_weight + sparsity_loss * self.config.sparsity_weight
                     + kld_loss * self.config.z_kl_weight + structure_loss * self.config.structure_weight)
             losses = {"total_loss": loss.item(), "Src_cls_loss": class_loss.item(),
+                      "source_supervised_loss": source_loss.item(),
+                      "target_pseudo_label_loss": pseudo_loss.item(),
                       "rec_loss": rec_loss.item(),
                       "sparsity_loss": sparsity_loss.item(), "structure_loss": structure_loss.item(),
                       "kld_loss": kld_loss.item()}
@@ -135,6 +151,32 @@ class LCA(torch.nn.Module):
             self.optimizer.zero_grad()
 
             loss.backward()
+            if self.capture_batch_audit:
+                groups = {
+                    "encoder": self.z_net,
+                    "decoder": self.rec_net,
+                    "transition_prior": self.transition_prior_fix,
+                    "feature_extractor": self.feature_extractor,
+                    "classifier": self.classifier,
+                }
+                gradient_groups = {}
+                for name, module in groups.items():
+                    gradient_groups[name] = any(
+                        parameter.grad is not None
+                        and torch.isfinite(parameter.grad).all().item()
+                        and parameter.grad.detach().abs().sum().item() > 0
+                        for parameter in module.parameters()
+                    )
+                threshold_gradient = (
+                    self.threa.grad is not None
+                    and torch.isfinite(self.threa.grad).all().item()
+                    and self.threa.grad.detach().abs().sum().item() > 0
+                )
+                self.last_batch_audit = {
+                    "losses": losses.copy(),
+                    "gradient_groups": gradient_groups,
+                    "threshold_gradient_nonzero": threshold_gradient,
+                }
             self.optimizer.step()
             for key, val in losses.items():
                 avg_meter[key].update(val, 32)
@@ -181,18 +223,24 @@ class LCA(torch.nn.Module):
 
         x = torch.cat((src_x, tgt_x), dim=0).permute(0, 2, 1)
         rec = torch.cat((src_rec, tgt_rec), dim=0)
-        class_loss = self.cross_entropy(src_class, src_label)
+        source_class_loss = self.cross_entropy(
+            self.policy.cross_entropy_input(src_class), src_label
+        )
 
-        pseudo_cls_loss = 0
+        pseudo_cls_loss = torch.tensor(0.0, device=x.device)
         if epoch > self.config.start_psuedo_step:
-            tat_p = F.softmax(tgt_class, dim=-1)
+            tat_p = self.policy.pseudo_probabilities(tgt_class)
             prob, pseudo_label = tat_p.max(dim=-1)
             conf_mask = (prob > self.config.tar_psuedo_thre)
             if conf_mask.any().item():
-                pseudo_cls_loss = self.cross_entropy(tgt_class[conf_mask], pseudo_label[conf_mask])
-            class_loss = class_loss + pseudo_cls_loss * 0.5
+                pseudo_cls_loss = self.cross_entropy(
+                    self.policy.cross_entropy_input(tgt_class[conf_mask]),
+                    pseudo_label[conf_mask],
+                )
+        class_loss = source_class_loss + pseudo_cls_loss * 0.5
         if no_kl:
-            return (class_loss, torch.tensor(0, device=x.device), torch.tensor(0, device=x.device),
+            return (class_loss, source_class_loss, pseudo_cls_loss,
+                    torch.tensor(0, device=x.device), torch.tensor(0, device=x.device),
                     torch.tensor(0, device=x.device), torch.tensor(0, device=x.device))
         rec_loss = self.rec_criterion(x, rec) / x.shape[0]
         z_mean = torch.cat((src_z_mean, tgt_z_mean), dim=0)
@@ -243,7 +291,8 @@ class LCA(torch.nn.Module):
             structure_loss = structure_loss + torch.sum((src_jac * mask.detach() - trg_jac * mask) ** 2)
         sparsity_loss = sparsity_loss / rate
         structure_loss = structure_loss / rate
-        return class_loss, rec_loss, sparsity_loss, kld_loss, structure_loss
+        return (class_loss, source_class_loss, pseudo_cls_loss, rec_loss,
+                sparsity_loss, kld_loss, structure_loss)
 
     @property
     def base_dist(self):

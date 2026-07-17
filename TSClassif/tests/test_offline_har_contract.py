@@ -43,10 +43,10 @@ class OfflineHarContractTests(unittest.TestCase):
             "--scenario",
             "--num_epochs",
             "--run_ids",
-            "--training_protocol",
-            "--metric_protocol",
+            "--protocol",
         ):
             self.assertIn(flag, run_source)
+        self.assertIn("choices=PROTOCOL_NAMES", run_source)
 
     def test_get_features_returns_sampled_latent(self):
         tree = ast.parse(source("algorithms/algorithms.py"))
@@ -73,28 +73,27 @@ class OfflineHarContractTests(unittest.TestCase):
         self.assertNotIn("from torchmetrics", trainer_source)
         for name in ("accuracy_score", "f1_score", "roc_auc_score"):
             self.assertIn(name, trainer_source)
-        self.assertIn("_official_scores", trainer_source)
-        self.assertIn(
-            'accumulate=self.metric_protocol == "official_stateful_no_reset"',
-            trainer_source,
-        )
+        self.assertIn("official_forward_f1", trainer_source)
+        self.assertIn("official_accumulated_compute_f1_audit", trainer_source)
+        self.assertIn("self.official_f1_metric.compute()", trainer_source)
         evaluator = source("reproduction/UCIHAR/evaluate_checkpoints.py")
-        self.assertNotIn("_official_scores", evaluator)
+        self.assertNotIn("official_f1_metric", evaluator)
 
     def test_two_target_evaluation_protocols_are_explicit(self):
         algorithm_source = source("algorithms/algorithms.py")
-        self.assertIn('training_protocol == "paper_code_protocol"', algorithm_source)
-        self.assertIn('training_protocol == "baseline_clean_protocol"', algorithm_source)
+        policy_source = source("protocol_policy.py")
+        self.assertIn('"corrected_public": ProtocolPolicy(', policy_source)
+        self.assertIn('"clean_baseline": ProtocolPolicy(', policy_source)
         self.assertIn("metric = value_method(is_train=False)[1]", algorithm_source)
-        self.assertIn("self.train()", algorithm_source)
-        paper_block = algorithm_source.split(
-            'training_protocol == "paper_code_protocol"', 1
-        )[1].split("logger.debug(f'-------------------------------------')", 1)[0]
-        self.assertNotIn("self.train()", paper_block)
+        self.assertIn("self.policy.begin_epoch(self, avg_meter)", algorithm_source)
+        self.assertIn("restore_mode_after_evaluation=False", policy_source)
+        self.assertIn("restore_mode_after_evaluation=True", policy_source)
 
     def test_checkpoint_selection_preserves_public_src_cls_loss(self):
         algorithm_source = source("algorithms/algorithms.py")
-        self.assertIn("avg_meter['Src_cls_loss'].avg < best_src_risk", algorithm_source)
+        policy_source = source("protocol_policy.py")
+        self.assertIn("self.policy.checkpoint_candidate(epoch, avg_meter)", algorithm_source)
+        self.assertIn('meters["Src_cls_loss"].avg', policy_source)
         self.assertNotIn("Src_selection_loss", algorithm_source)
 
     def test_target_test_is_loaded_before_training_but_not_used_for_selection(self):
@@ -114,28 +113,29 @@ class OfflineHarContractTests(unittest.TestCase):
         evaluator_path = ROOT / "reproduction" / "UCIHAR" / "evaluate_checkpoints.py"
         self.assertTrue(evaluator_path.is_file())
         evaluator = evaluator_path.read_text(encoding="utf-8")
-        self.assertIn("for checkpoint_name in (\"best\", \"last\")", evaluator)
-        self.assertIn("labels=list(range(6))", evaluator)
+        self.assertIn("for checkpoint_name in (\"last\", \"best_source\")", evaluator)
+        self.assertIn("labels=list(range(num_classes))", evaluator)
         self.assertIn("zero_division=0", evaluator)
         self.assertIn("f1_score(", evaluator)
         self.assertIn("accuracy_score(", evaluator)
         self.assertNotIn("from torchmetrics", evaluator)
-        self.assertIn("reported_metric_fields", evaluator)
         self.assertNotIn('"get_features_returns_z": True', evaluator)
         self.assertNotIn('"metric_reset_fixed": True', evaluator)
+        self.assertIn("validate_checkpoint_metadata", evaluator)
 
     def test_results_and_checkpoints_record_protocol_metadata(self):
         trainer_source = source("trainers/train.py")
         for field in (
-            "training_protocol",
-            "metric_protocol",
+            '"protocol"',
+            "classifier_output_type",
+            "cross_entropy_input_type",
+            "target_test_reads_during_training",
             "get_features_returns_z",
-            "metric_reset_fixed",
         ):
             self.assertIn(field, trainer_source)
         abstract_source = source("trainers/abstract_trainer.py")
         self.assertIn('"metadata": metadata', abstract_source)
-        self.assertIn('"best_epoch"', trainer_source)
+        self.assertIn('"best_source_epoch"', trainer_source)
 
     def test_failures_are_recorded_and_reraised_before_checkpoint(self):
         trainer_source = source("trainers/train.py")

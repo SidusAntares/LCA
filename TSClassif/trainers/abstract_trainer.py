@@ -24,6 +24,9 @@ from algorithms.algorithms import get_algorithm_class, LCA
 from models.models import get_backbone_class
 from run_config import parse_scenario, resolve_run_ids
 from reproduction.UCIHAR.protocol_audit import audit_corrected_public_implementation
+from protocol_policy import get_protocol_policy
+from metric_protocol import create_official_f1_metric
+from checkpoint_metadata import validate_checkpoint_metadata
 
 warnings.filterwarnings("ignore", category=sklearn.exceptions.UndefinedMetricWarning)
 
@@ -41,11 +44,13 @@ class AbstractTrainer(object):
 
         # Exp Description
         self.experiment_description = args.dataset
+        self.policy = get_protocol_policy(args.protocol)
+        self.protocol = self.policy.name
         self.run_description = f"{args.da_method}_{args.exp_name}"
 
         # paths
         self.home_path = os.getcwd()  # os.path.dirname(os.getcwd())
-        self.save_dir = args.save_dir
+        self.save_dir = os.path.join(args.save_dir, self.policy.output_namespace)
         self.data_path = os.path.join(args.data_path, self.dataset)
         # self.create_save_dir(os.path.join(self.home_path,  self.save_dir ))
         self.exp_log_dir = os.path.join(self.home_path, self.save_dir, self.experiment_description,
@@ -55,17 +60,6 @@ class AbstractTrainer(object):
         # Specify runs
         self.num_runs = args.num_runs
         self.run_ids = resolve_run_ids(args.run_ids, args.num_runs)
-        self.training_protocol = args.training_protocol
-        self.metric_protocol = args.metric_protocol
-        expected_metric_protocol = {
-            "paper_code_protocol": "official_stateful_no_reset",
-            "baseline_clean_protocol": "stateless_current",
-        }[self.training_protocol]
-        if self.metric_protocol != expected_metric_protocol:
-            raise ValueError(
-                f"{self.training_protocol} requires metric protocol "
-                f"{expected_metric_protocol}, got {self.metric_protocol}"
-            )
         self.protocol_audit = audit_corrected_public_implementation()
         if not self.protocol_audit["passed"]:
             raise RuntimeError(
@@ -92,12 +86,18 @@ class AbstractTrainer(object):
 
         # metrics
         self.num_classes = self.dataset_configs.num_classes
-        # Reproduce the public torchmetrics objects' no-reset behavior without
-        # requiring torchmetrics in the offline environment.  This history is
-        # used only for the training-reported diagnostic value; the reproduction
-        # evaluator uses fresh local arrays for every checkpoint.
-        self._official_scores = []
-        self._official_labels = []
+        self.official_f1_metric = None
+        self.torchmetrics_version = "not_used"
+        self.metric_backend = "sklearn_stateless"
+        if self.policy.metric_protocol == "torchmetrics_1_3_2_forward_persistent_state":
+            self.official_f1_metric, self.torchmetrics_version = (
+                create_official_f1_metric(self.num_classes)
+            )
+            self.metric_backend = self.official_f1_metric.backend
+        self.official_forward_f1 = None
+        self.official_accumulated_compute_f1_audit = None
+        self.target_test_reads_during_training = 0
+        self.training_active = False
         self.args = args
 
         # metrics
@@ -113,16 +113,22 @@ class AbstractTrainer(object):
 
         # Initilaize the algorithm
         if self.args.da_method == "LCA":
-            self.algorithm = algorithm_class(self.LCA_config, self.dataset_configs, self.hparams,
-                                             self.device)
+            self.algorithm = algorithm_class(
+                self.LCA_config, self.dataset_configs, self.hparams,
+                self.device, self.policy,
+            )
         else:
             self.algorithm = algorithm_class(backbone_fe, self.dataset_configs, self.hparams, self.device)
         self.algorithm.to(self.device)
 
     def load_checkpoint(self, model_dir):
         checkpoint = load_torch_file(os.path.join(self.home_path, model_dir, 'checkpoint.pt'))
+        validate_checkpoint_metadata(
+            checkpoint.get("metadata", {}), self.policy,
+            self.protocol_audit["fingerprint_sha256"],
+        )
         last_model = checkpoint['last']
-        best_model = checkpoint['best']
+        best_model = checkpoint['best_source']
         return last_model, best_model
 
     def train_model(self):
@@ -137,11 +143,13 @@ class AbstractTrainer(object):
         # Training the model
         self.last_model, self.best_model = self.algorithm.update(self.src_train_dl, self.trg_train_dl,
                                                                  self.loss_avg_meters, self.logger,
-                                                                 self.calculate_metrics,
-                                                                 self.training_protocol)
+                                                                 self.calculate_metrics)
         return self.last_model, self.best_model
 
-    def evaluate(self, test_loader, is_train=True):
+    def evaluate(self, test_loader, is_train=False):
+        previous_mode = self.algorithm.training
+        if self.training_active and test_loader is self.trg_test_dl:
+            self.target_test_reads_during_training += 1
         if isinstance(self.algorithm, LCA):
             self.algorithm.eval()
             if is_train:
@@ -182,6 +190,8 @@ class AbstractTrainer(object):
         self.loss = torch.tensor(total_loss).mean()  # average loss
         self.full_preds = torch.cat((preds_list))
         self.full_labels = torch.cat((labels_list))
+        if self.policy.restore_mode_after_evaluation:
+            self.algorithm.train(previous_mode)
 
     def get_configs(self):
         dataset_class = get_dataset_class(self.dataset)
@@ -205,14 +215,12 @@ class AbstractTrainer(object):
             self.trg_test_dl, self.dataset_configs, 5
         )
 
-    def _compute_metrics(self, accumulate=False):
+    def _compute_metrics(self):
         scores = self.full_preds.detach().cpu().numpy()
+        probability_scores = self.policy.probabilities(
+            self.full_preds
+        ).detach().cpu().numpy()
         labels = self.full_labels.detach().cpu().numpy()
-        if accumulate:
-            self._official_scores.append(scores.copy())
-            self._official_labels.append(labels.copy())
-            scores = np.concatenate(self._official_scores, axis=0)
-            labels = np.concatenate(self._official_labels, axis=0)
         predicted = scores.argmax(axis=1)
         acc = accuracy_score(labels, predicted)
         f1 = f1_score(
@@ -233,7 +241,7 @@ class AbstractTrainer(object):
             try:
                 auroc = roc_auc_score(
                     labels,
-                    scores,
+                    probability_scores,
                     labels=list(range(self.num_classes)),
                     multi_class="ovr",
                     average="macro",
@@ -273,7 +281,7 @@ class AbstractTrainer(object):
     def save_checkpoint(self, home_path, log_dir, last_model, best_model, metadata):
         save_dict = {
             "last": last_model,
-            "best": best_model,
+            "best_source": best_model,
             "metadata": metadata,
         }
         # save classification report
@@ -324,12 +332,21 @@ class AbstractTrainer(object):
         wandb.log(summary_metrics)
         wandb.log(summary_risks)
 
-    def calculate_metrics(self, is_train=True):
+    def calculate_metrics(self, is_train=False):
 
         self.evaluate(self.trg_test_dl, is_train)
-        return self._compute_metrics(
-            accumulate=self.metric_protocol == "official_stateful_no_reset"
-        )
+        acc, stateless_f1, auroc = self._compute_metrics()
+        if self.policy.metric_protocol == "torchmetrics_1_3_2_forward_persistent_state":
+            predictions = self.full_preds.argmax(dim=1).cpu()
+            labels = self.full_labels.cpu()
+            self.official_forward_f1 = float(
+                self.official_f1_metric(predictions, labels)
+            )
+            self.official_accumulated_compute_f1_audit = float(
+                self.official_f1_metric.compute()
+            )
+            return acc, self.official_forward_f1, auroc
+        return acc, stateless_f1, auroc
 
     def calculate_risks(self):
         # calculation based source test data

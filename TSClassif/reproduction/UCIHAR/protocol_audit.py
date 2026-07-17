@@ -11,6 +11,9 @@ AUDITED_FILES = [
     TSCLASSIF_ROOT / "configs" / "LCA_config.py",
     TSCLASSIF_ROOT / "models" / "models.py",
     TSCLASSIF_ROOT / "dataloader" / "dataloader.py",
+    TSCLASSIF_ROOT / "protocol_policy.py",
+    TSCLASSIF_ROOT / "metric_protocol.py",
+    TSCLASSIF_ROOT / "checkpoint_metadata.py",
 ]
 
 
@@ -34,17 +37,22 @@ def audit_corrected_public_implementation():
     config = sources["configs/LCA_config.py"]
     models = sources["models/models.py"]
     dataloader = sources["dataloader/dataloader.py"]
+    policy = sources["protocol_policy.py"]
     checks = {
         "get_features_returns_z": _get_features_returns_sampled_z(algorithm),
         "base_dist_mean_registered": "register_buffer('base_dist_mean'" in algorithm,
         "base_dist_var_registered": "register_buffer('base_dist_var'" in algorithm,
         "public_checkpoint_selector": (
-            "avg_meter['Src_cls_loss'].avg < best_src_risk" in algorithm
-            and "Src_selection_loss" not in algorithm
+            "self.policy.checkpoint_candidate(epoch, avg_meter)" in algorithm
+            and "upstream_cumulative_src_cls_every_10" in policy
+            and 'meters["Src_cls_loss"].avg' in policy
         ),
         "pseudo_epoch_30": "default=30" in config,
         "pseudo_threshold_099": "default=0.99" in config,
-        "softmax_classifier": "nn.Softmax(dim=-1)" in models,
+        "softmax_classifier": (
+            'output_type == "probabilities"' in models
+            and "nn.Softmax(dim=-1)" in models
+        ),
         "public_normalization": "transforms.Normalize" in dataloader,
     }
     digest = hashlib.sha256()
@@ -58,4 +66,3 @@ def audit_corrected_public_implementation():
         "checks": checks,
         "fingerprint_sha256": digest.hexdigest(),
     }
-

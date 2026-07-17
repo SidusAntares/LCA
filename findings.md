@@ -1,25 +1,15 @@
 # Findings
 
-## Protocol audit
-
-- Public LCA calls target-test evaluation after every epoch.
-- `AbstractTrainer.evaluate()` calls `self.algorithm.eval()`.
-- The public epoch loop does not restore `train()` after evaluation.
-- CNN contains BatchNorm1d and Dropout, so paper-code and clean training may produce different model parameters.
-- Best checkpoint selection remains based on accumulated source classification loss and does not use target-test labels.
-- The required corrected-public change is `get_features(): (z_mean, z_std, z)`; prior buffers, pseudo-label defaults, loss weights, normalization, and checkpoint selector remain public semantics.
-
-## Result protocol
-
-- Only `official_stateful_no_reset` may populate `official_reported_f1`.
-- `stateless_current` populates `current_reported_f1`; clean checkpoint values are independent one-pass metrics.
-- Runtime audit and protocol fingerprint metadata are required for formal checkpoint evaluation.
-- Legacy 18→14 run 0 remains historical smoke evidence only and cannot enter formal CSVs, completion counts, or reproduction judgments.
-
-## Required server order
-
-1. Run only the 20→9 seed-0 protocol comparison.
-2. Review parameter hashes, best epoch, and best/last clean F1.
-3. Select one protocol and run the three-task diagnostic.
-4. Review diagnostic files; launch the full matrix manually only if acceptable.
-
+- Local workspace has no HAR dataset; local smoke must be synthetic and real 18→14 smoke remains a server action.
+- Upstream TorchMetrics 1.3.2 `forward` returns the current-call full-test metric while persistent state is updated; only explicit `compute()` is accumulated.
+- Existing concatenated-history F1 must not populate the official forward field.
+- Current code already has one LCA and Trainer; protocol differences can be centralized without model duplication.
+- Current branch starts at committed reproduction work `a3cd02c`; upstream public reference is `45c091f`.
+- Local default Python has a broken NumPy DLL; verification uses
+  `D:\Miniconda\envs\book\python.exe` (PyTorch 2.6.0, NumPy 1.26.4,
+  sklearn 1.6.1). The smoke provides a narrowly scoped offline `einops`
+  fallback only when the dependency is absent.
+- The upstream threshold parameter receives zero gradient in the synthetic
+  full-loss step because the shared additive threshold cancels when the source
+  and target straight-through masks are subtracted. This is reported as a
+  non-gating audit and the frozen loss formula is not changed.

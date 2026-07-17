@@ -17,6 +17,7 @@ from algorithms.algorithms import get_algorithm_class
 from models.models import get_backbone_class
 from trainers.abstract_trainer import AbstractTrainer
 from compat import load_torch_file
+from checkpoint_metadata import validate_checkpoint_metadata
 import traceback
 
 
@@ -36,8 +37,10 @@ class Trainer(AbstractTrainer):
             "scenario", "run", "acc", "f1_score", "auroc", "status",
             "runtime_seconds", "peak_gpu_memory_mb", "checkpoint_path",
             "git_commit", "python_version", "torch_version", "cuda_version",
-            "training_protocol", "metric_protocol", "get_features_returns_z",
-            "metric_reset_fixed", "best_epoch", "last_epoch",
+            "protocol", "official_forward_f1",
+            "official_accumulated_compute_f1_audit",
+            "target_test_reads_during_training", "classifier_output_type",
+            "cross_entropy_input_type", "best_source_epoch", "last_epoch",
             "protocol_fingerprint_sha256",
         ]
         self.evaluation_columns = ["scenario", "run", "acc", "f1_score", "auroc"]
@@ -58,8 +61,7 @@ class Trainer(AbstractTrainer):
             "exception_type": type(exc).__name__,
             "message": str(exc),
             "traceback": traceback.format_exc(),
-            "training_protocol": self.training_protocol,
-            "metric_protocol": self.metric_protocol,
+            "protocol": self.protocol,
         }
         failure_path = os.path.join(self.exp_log_dir, "failed_runs.jsonl")
         with open(failure_path, "a", encoding="utf-8") as handle:
@@ -93,11 +95,11 @@ class Trainer(AbstractTrainer):
             metadata = checkpoint.get("metadata", {})
             return (
                 checkpoint.get("last") is not None
-                and checkpoint.get("best") is not None
-                and metadata.get("training_protocol") == self.training_protocol
-                and metadata.get("metric_protocol") == self.metric_protocol
-                and metadata.get("protocol_fingerprint_sha256")
-                == self.protocol_audit["fingerprint_sha256"]
+                and checkpoint.get("best_source") is not None
+                and validate_checkpoint_metadata(
+                    metadata, self.policy,
+                    self.protocol_audit["fingerprint_sha256"],
+                ) is metadata
             )
         except Exception:
             return False
@@ -118,6 +120,7 @@ class Trainer(AbstractTrainer):
                     continue
                 # fixing random seed
                 fix_randomness(run_id)
+                self.target_test_reads_during_training = 0
 
                 # Logging
                 self.logger, self.scenario_log_dir = starting_logs(self.dataset, self.da_method, self.exp_log_dir,
@@ -133,40 +136,80 @@ class Trainer(AbstractTrainer):
                         torch.cuda.set_device(self.device)
                         torch.cuda.reset_peak_memory_stats()
 
-                    include_target_test = (
-                        self.training_protocol == "paper_code_protocol"
-                    )
+                    include_target_test = self.policy.evaluate_target_during_training
                     self.load_data(
                         src_id,
                         trg_id,
                         include_target_test=include_target_test,
                     )
                     self.initialize_algorithm()
-                    self.last_model, self.best_model = self.algorithm.update(self.src_train_dl, self.trg_train_dl,
-                                                                             self.loss_avg_meters, self.logger,
-                                                                             self.calculate_metrics,
-                                                                             self.training_protocol)
+                    self.training_active = True
+                    try:
+                        self.last_model, self.best_model = self.algorithm.update(
+                            self.src_train_dl, self.trg_train_dl,
+                            self.loss_avg_meters, self.logger,
+                            self.calculate_metrics,
+                        )
+                    finally:
+                        self.training_active = False
 
                     # Save only after update completed successfully.
                     scenario = f"{src_id}_to_{trg_id}"
                     run_metadata = {
+                        "protocol": self.protocol,
+                        "upstream_commit": "45c091fca909ac13675c6ddac7e0464f0a186355",
+                        "current_commit": self._git_commit(),
                         "scenario": scenario,
                         "run_id": run_id,
                         "seed": run_id,
-                        "training_protocol": self.training_protocol,
-                        "metric_protocol": self.metric_protocol,
+                        "epoch": self.algorithm.last_epoch,
+                        "model_training_mode": self.algorithm.training,
+                        "epoch_mode_trace": self.algorithm.epoch_mode_trace,
+                        "classifier_output_type": self.policy.classifier_output_type,
+                        "cross_entropy_input_type": self.policy.cross_entropy_input_type,
+                        "target_test_reads_during_training": self.target_test_reads_during_training,
+                        "checkpoint_selection_rule": self.policy.checkpoint_selection_rule,
+                        "primary_checkpoint": self.policy.primary_checkpoint,
                         "get_features_returns_z": self.protocol_audit["checks"][
                             "get_features_returns_z"
                         ],
-                        "metric_reset_fixed": (
-                            self.metric_protocol != "official_stateful_no_reset"
+                        "base_dist_mean_registered": (
+                            "base_dist_mean" in dict(self.algorithm.named_buffers())
                         ),
-                        "best_epoch": self.algorithm.best_epoch,
+                        "prior_enabled": not self.algorithm.config.No_prior,
+                        "loss_weights": {
+                            "class": self.algorithm.config.class_weight,
+                            "reconstruction": self.algorithm.config.rec_weight,
+                            "sparsity": self.algorithm.config.sparsity_weight,
+                            "kl": self.algorithm.config.z_kl_weight,
+                            "structure": self.algorithm.config.structure_weight,
+                        },
+                        "pseudo_threshold": self.algorithm.config.tar_psuedo_thre,
+                        "pseudo_start_epoch": self.algorithm.config.start_psuedo_step,
+                        "python_version": platform.python_version(),
+                        "torch_version": torch.__version__,
+                        "cuda_version": torch.version.cuda or "none",
+                        "gpu_name": (
+                            torch.cuda.get_device_name(self.device)
+                            if self.device.type == "cuda" else "cpu"
+                        ),
+                        "cudnn_deterministic": torch.backends.cudnn.deterministic,
+                        "cudnn_benchmark": torch.backends.cudnn.benchmark,
+                        "deterministic_algorithms_enabled": (
+                            torch.are_deterministic_algorithms_enabled()
+                        ),
+                        "metric_backend": self.metric_backend,
+                        "torchmetrics_version": self.torchmetrics_version,
+                        "best_source_epoch": self.algorithm.best_epoch,
                         "last_epoch": self.algorithm.last_epoch,
                         "protocol_fingerprint_sha256": self.protocol_audit[
                             "fingerprint_sha256"
                         ],
                     }
+                    validate_checkpoint_metadata(
+                        run_metadata, self.policy,
+                        self.protocol_audit["fingerprint_sha256"],
+                    )
                     self.save_checkpoint(self.home_path, self.scenario_log_dir,
                                          self.last_model, self.best_model,
                                          run_metadata)
@@ -175,7 +218,13 @@ class Trainer(AbstractTrainer):
                     # after training and checkpoint selection have finished.
                     if self.trg_test_dl is None:
                         self.load_target_evaluation_data(trg_id)
-                    metrics = self.calculate_metrics()
+                    primary_state = (
+                        self.last_model
+                        if self.policy.primary_checkpoint == "last"
+                        else self.best_model
+                    )
+                    self.algorithm.load_state_dict(primary_state)
+                    metrics = self.calculate_metrics(is_train=False)
                     risks = self.calculate_risks()
                     runtime_seconds = time.perf_counter() - started_at
                     peak_gpu_memory_mb = (
@@ -196,11 +245,13 @@ class Trainer(AbstractTrainer):
                         platform.python_version(),
                         torch.__version__,
                         torch.version.cuda or "none",
-                        self.training_protocol,
-                        self.metric_protocol,
-                        run_metadata["get_features_returns_z"],
-                        run_metadata["metric_reset_fixed"],
-                        run_metadata["best_epoch"],
+                        self.protocol,
+                        self.official_forward_f1,
+                        self.official_accumulated_compute_f1_audit,
+                        run_metadata["target_test_reads_during_training"],
+                        run_metadata["classifier_output_type"],
+                        run_metadata["cross_entropy_input_type"],
+                        run_metadata["best_source_epoch"],
                         run_metadata["last_epoch"],
                         run_metadata["protocol_fingerprint_sha256"],
                     )

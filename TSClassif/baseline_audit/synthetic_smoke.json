@@ -1,0 +1,78 @@
+[
+  {
+    "protocol": "corrected_public",
+    "classifier_output_type": "probabilities",
+    "cross_entropy_input_type": "probabilities",
+    "prior_disabled": false,
+    "base_dist_accessible": true,
+    "pseudo_label_path_exercised": true,
+    "optimizer_step_changed_parameter": true,
+    "finite_losses": {
+      "total_loss": true,
+      "Src_cls_loss": true,
+      "source_supervised_loss": true,
+      "target_pseudo_label_loss": true,
+      "rec_loss": true,
+      "sparsity_loss": true,
+      "structure_loss": true,
+      "kld_loss": true
+    },
+    "losses": {
+      "total_loss": 1.8652148246765137,
+      "Src_cls_loss": 1.792662262916565,
+      "source_supervised_loss": 1.792662262916565,
+      "target_pseudo_label_loss": 0.0,
+      "rec_loss": 0.6822400689125061,
+      "sparsity_loss": 0.5185633897781372,
+      "structure_loss": 0.016561968252062798,
+      "kld_loss": 2.1538174152374268
+    },
+    "gradient_groups": {
+      "encoder": true,
+      "decoder": true,
+      "transition_prior": true,
+      "feature_extractor": true,
+      "classifier": true
+    },
+    "threshold_gradient_nonzero_audit": false,
+    "passed": true
+  },
+  {
+    "protocol": "clean_baseline",
+    "classifier_output_type": "logits",
+    "cross_entropy_input_type": "logits",
+    "prior_disabled": false,
+    "base_dist_accessible": true,
+    "pseudo_label_path_exercised": true,
+    "optimizer_step_changed_parameter": true,
+    "finite_losses": {
+      "total_loss": true,
+      "Src_cls_loss": true,
+      "source_supervised_loss": true,
+      "target_pseudo_label_loss": true,
+      "rec_loss": true,
+      "sparsity_loss": true,
+      "structure_loss": true,
+      "kld_loss": true
+    },
+    "losses": {
+      "total_loss": 1.8797446489334106,
+      "Src_cls_loss": 1.807192087173462,
+      "source_supervised_loss": 1.807192087173462,
+      "target_pseudo_label_loss": 0.0,
+      "rec_loss": 0.6822400689125061,
+      "sparsity_loss": 0.5185633897781372,
+      "structure_loss": 0.016561968252062798,
+      "kld_loss": 2.1538174152374268
+    },
+    "gradient_groups": {
+      "encoder": true,
+      "decoder": true,
+      "transition_prior": true,
+      "feature_extractor": true,
+      "classifier": true
+    },
+    "threshold_gradient_nonzero_audit": false,
+    "passed": true
+  }
+]

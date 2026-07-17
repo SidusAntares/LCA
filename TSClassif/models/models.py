@@ -87,10 +87,18 @@ def weights_init(m):
 
 
 class classifier(nn.Module):
-    def __init__(self, configs):
+    def __init__(self, configs, output_type="probabilities"):
         super(classifier, self).__init__()
-        self.logits = nn.Sequential(nn.Linear(configs.features_len * configs.final_out_channels, configs.num_classes),
-                                    nn.Softmax(dim=-1))
+        if output_type not in ("probabilities", "logits"):
+            raise ValueError(f"unsupported classifier output type: {output_type}")
+        layers = [nn.Linear(
+            configs.features_len * configs.final_out_channels,
+            configs.num_classes,
+        )]
+        if output_type == "probabilities":
+            layers.append(nn.Softmax(dim=-1))
+        self.logits = nn.Sequential(*layers)
+        self.output_type = output_type
         self.configs = configs
 
     def forward(self, x):

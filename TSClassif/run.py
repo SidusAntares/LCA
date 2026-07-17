@@ -3,6 +3,7 @@ from configs.LCA_config import get_model_a_parser
 from trainers.train import Trainer
 
 import argparse
+from protocol_policy import PROTOCOL_NAMES
 
 parser = argparse.ArgumentParser()
 
@@ -33,18 +34,8 @@ if __name__ == "__main__":
                         help='Run one scenario as SRC,TGT; defaults to all official scenarios')
     parser.add_argument('--num_epochs', default=None, type=int,
                         help='Override the dataset default epoch count')
-    parser.add_argument(
-        '--training_protocol',
-        required=True,
-        choices=('paper_code_protocol', 'baseline_clean_protocol'),
-        help='Explicit target-evaluation/training-mode protocol',
-    )
-    parser.add_argument(
-        '--metric_protocol',
-        required=True,
-        choices=('official_stateful_no_reset', 'stateless_current'),
-        help='Provenance of the metric written to results.csv',
-    )
+    parser.add_argument('--protocol', required=True, choices=PROTOCOL_NAMES,
+                        help='LCA baseline protocol')
     parser.add_argument('--device', default="cuda:0", type=str, help='cpu or cuda')
 
     # arguments
