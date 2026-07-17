@@ -27,6 +27,24 @@ if __name__ == "__main__":
 
     # ========= Experiment settings ===============
     parser.add_argument('--num_runs', default=1, type=int, help='Number of consecutive run with different seeds')
+    parser.add_argument('--run_ids', default=None, type=str,
+                        help='Comma-separated run IDs; defaults to range(num_runs)')
+    parser.add_argument('--scenario', default=None, type=str,
+                        help='Run one scenario as SRC,TGT; defaults to all official scenarios')
+    parser.add_argument('--num_epochs', default=None, type=int,
+                        help='Override the dataset default epoch count')
+    parser.add_argument(
+        '--training_protocol',
+        required=True,
+        choices=('paper_code_protocol', 'baseline_clean_protocol'),
+        help='Explicit target-evaluation/training-mode protocol',
+    )
+    parser.add_argument(
+        '--metric_protocol',
+        required=True,
+        choices=('official_stateful_no_reset', 'stateless_current'),
+        help='Provenance of the metric written to results.csv',
+    )
     parser.add_argument('--device', default="cuda:0", type=str, help='cpu or cuda')
 
     # arguments

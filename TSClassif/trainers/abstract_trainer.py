@@ -3,22 +3,27 @@ import sys
 sys.path.append('../../ADATIME/')
 import torch
 import torch.nn.functional as F
-from torchmetrics import Accuracy, AUROC, F1Score
 import os
-import wandb
 import pandas as pd
 import numpy as np
 import warnings
 import sklearn.exceptions
-import collections
+from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 
-from torchmetrics import Accuracy, AUROC, F1Score
+try:
+    import wandb
+except ImportError:  # wandb is not required by the local training flow.
+    wandb = None
+
+from compat import load_torch_file
 from dataloader.dataloader import data_generator, few_shot_data_generator
 from configs.data_model_configs import get_dataset_class
 from configs.hparams import get_hparams_class
 from utils import fix_randomness, starting_logs, DictAsObject, AverageMeter
 from algorithms.algorithms import get_algorithm_class, LCA
 from models.models import get_backbone_class
+from run_config import parse_scenario, resolve_run_ids
+from reproduction.UCIHAR.protocol_audit import audit_corrected_public_implementation
 
 warnings.filterwarnings("ignore", category=sklearn.exceptions.UndefinedMetricWarning)
 
@@ -49,6 +54,24 @@ class AbstractTrainer(object):
 
         # Specify runs
         self.num_runs = args.num_runs
+        self.run_ids = resolve_run_ids(args.run_ids, args.num_runs)
+        self.training_protocol = args.training_protocol
+        self.metric_protocol = args.metric_protocol
+        expected_metric_protocol = {
+            "paper_code_protocol": "official_stateful_no_reset",
+            "baseline_clean_protocol": "stateless_current",
+        }[self.training_protocol]
+        if self.metric_protocol != expected_metric_protocol:
+            raise ValueError(
+                f"{self.training_protocol} requires metric protocol "
+                f"{expected_metric_protocol}, got {self.metric_protocol}"
+            )
+        self.protocol_audit = audit_corrected_public_implementation()
+        if not self.protocol_audit["passed"]:
+            raise RuntimeError(
+                "corrected public implementation audit failed: "
+                f"{self.protocol_audit['checks']}"
+            )
 
         # get dataset and base model configs
         self.dataset_configs, self.hparams_class = self.get_configs()
@@ -60,12 +83,21 @@ class AbstractTrainer(object):
 
         self.hparams = {**self.hparams_class.alg_hparams[self.da_method],
                         **self.hparams_class.train_params}
+        if args.num_epochs is not None:
+            if args.num_epochs < 1:
+                raise ValueError("--num_epochs must be at least 1")
+            self.hparams["num_epochs"] = args.num_epochs
+        if args.scenario is not None:
+            self.dataset_configs.scenarios = parse_scenario(args.scenario)
 
         # metrics
         self.num_classes = self.dataset_configs.num_classes
-        self.ACC = Accuracy(task="multiclass", num_classes=self.num_classes)
-        self.F1 = F1Score(task="multiclass", num_classes=self.num_classes, average="macro")
-        self.AUROC = AUROC(task="multiclass", num_classes=self.num_classes)
+        # Reproduce the public torchmetrics objects' no-reset behavior without
+        # requiring torchmetrics in the offline environment.  This history is
+        # used only for the training-reported diagnostic value; the reproduction
+        # evaluator uses fresh local arrays for every checkpoint.
+        self._official_scores = []
+        self._official_labels = []
         self.args = args
 
         # metrics
@@ -88,7 +120,7 @@ class AbstractTrainer(object):
         self.algorithm.to(self.device)
 
     def load_checkpoint(self, model_dir):
-        checkpoint = torch.load(os.path.join(self.home_path, model_dir, 'checkpoint.pt'))
+        checkpoint = load_torch_file(os.path.join(self.home_path, model_dir, 'checkpoint.pt'))
         last_model = checkpoint['last']
         best_model = checkpoint['best']
         return last_model, best_model
@@ -104,7 +136,9 @@ class AbstractTrainer(object):
 
         # Training the model
         self.last_model, self.best_model = self.algorithm.update(self.src_train_dl, self.trg_train_dl,
-                                                                 self.loss_avg_meters, self.logger)
+                                                                 self.loss_avg_meters, self.logger,
+                                                                 self.calculate_metrics,
+                                                                 self.training_protocol)
         return self.last_model, self.best_model
 
     def evaluate(self, test_loader, is_train=True):
@@ -154,15 +188,60 @@ class AbstractTrainer(object):
         hparams_class = get_hparams_class(self.dataset)
         return dataset_class(), hparams_class()
 
-    def load_data(self, src_id, trg_id):
+    def load_data(self, src_id, trg_id, include_target_test=False):
         self.src_train_dl = data_generator(self.data_path, src_id, self.dataset_configs, self.hparams, "train")
         self.src_test_dl = data_generator(self.data_path, src_id, self.dataset_configs, self.hparams, "test")
 
         self.trg_train_dl = data_generator(self.data_path, trg_id, self.dataset_configs, self.hparams, "train")
-        self.trg_test_dl = data_generator(self.data_path, trg_id, self.dataset_configs, self.hparams, "test")
+        self.trg_test_dl = None
+        self.few_shot_dl_5 = None
+        if include_target_test:
+            self.load_target_evaluation_data(trg_id)
 
-        self.few_shot_dl_5 = few_shot_data_generator(self.trg_test_dl, self.dataset_configs,
-                                                     5)  # set 5 to other value if you want other k-shot FST
+    def load_target_evaluation_data(self, trg_id):
+        """Load target test labels only after training (or explicitly for test phase)."""
+        self.trg_test_dl = data_generator(self.data_path, trg_id, self.dataset_configs, self.hparams, "test")
+        self.few_shot_dl_5 = few_shot_data_generator(
+            self.trg_test_dl, self.dataset_configs, 5
+        )
+
+    def _compute_metrics(self, accumulate=False):
+        scores = self.full_preds.detach().cpu().numpy()
+        labels = self.full_labels.detach().cpu().numpy()
+        if accumulate:
+            self._official_scores.append(scores.copy())
+            self._official_labels.append(labels.copy())
+            scores = np.concatenate(self._official_scores, axis=0)
+            labels = np.concatenate(self._official_labels, axis=0)
+        predicted = scores.argmax(axis=1)
+        acc = accuracy_score(labels, predicted)
+        f1 = f1_score(
+            labels,
+            predicted,
+            average="macro",
+            labels=list(range(self.num_classes)),
+            zero_division=0,
+        )
+        missing = sorted(set(range(self.num_classes)) - set(np.unique(labels).tolist()))
+        if missing:
+            warnings.warn(
+                f"AUROC is undefined because evaluation labels omit classes {missing}; returning NaN",
+                RuntimeWarning,
+            )
+            auroc = float("nan")
+        else:
+            try:
+                auroc = roc_auc_score(
+                    labels,
+                    scores,
+                    labels=list(range(self.num_classes)),
+                    multi_class="ovr",
+                    average="macro",
+                )
+            except ValueError as exc:
+                warnings.warn(f"AUROC could not be computed ({exc}); returning NaN", RuntimeWarning)
+                auroc = float("nan")
+        return acc, f1, auroc
 
     def create_save_dir(self, save_dir):
         if not os.path.exists(save_dir):
@@ -180,12 +259,7 @@ class AbstractTrainer(object):
         trg_risk = self.loss.item()
 
         # calculate metrics
-        acc = self.ACC(self.full_preds.argmax(dim=1).cpu(), self.full_labels.cpu()).item()
-        # f1_torch
-        f1 = self.F1(self.full_preds.argmax(dim=1).cpu(), self.full_labels.cpu()).item()
-        auroc = self.AUROC(self.full_preds.cpu(), self.full_labels.cpu()).item()
-        # f1_sk learn
-        # f1 = f1_score(self.full_preds.argmax(dim=1).cpu().numpy(), self.full_labels.cpu().numpy(), average='macro')
+        acc, f1, auroc = self._compute_metrics()
 
         risks = src_risk, fst_risk, trg_risk
         metrics = acc, f1, auroc
@@ -194,12 +268,13 @@ class AbstractTrainer(object):
 
     def save_tables_to_file(self, table_results, name):
         # save to file if needed
-        table_results.to_csv(os.path.join(self.exp_log_dir, f"{name}.csv"))
+        table_results.to_csv(os.path.join(self.exp_log_dir, f"{name}.csv"), index=False)
 
-    def save_checkpoint(self, home_path, log_dir, last_model, best_model):
+    def save_checkpoint(self, home_path, log_dir, last_model, best_model, metadata):
         save_dict = {
             "last": last_model,
-            "best": best_model
+            "best": best_model,
+            "metadata": metadata,
         }
         # save classification report
         save_path = os.path.join(home_path, log_dir, f"checkpoint.pt")
@@ -239,6 +314,8 @@ class AbstractTrainer(object):
 
     def wandb_logging(self, total_results, total_risks, summary_metrics, summary_risks):
         # log wandb
+        if wandb is None:
+            raise RuntimeError("wandb is not installed; local training does not require wandb logging")
         wandb.log({'results': total_results})
         wandb.log({'risks': total_risks})
         wandb.log({'hparams': wandb.Table(
@@ -250,14 +327,9 @@ class AbstractTrainer(object):
     def calculate_metrics(self, is_train=True):
 
         self.evaluate(self.trg_test_dl, is_train)
-        # accuracy  
-        acc = self.ACC(self.full_preds.argmax(dim=1).cpu(), self.full_labels.cpu()).item()
-        # f1
-        f1 = self.F1(self.full_preds.argmax(dim=1).cpu(), self.full_labels.cpu()).item()
-        # auroc 
-        auroc = self.AUROC(self.full_preds.cpu(), self.full_labels.cpu()).item()
-
-        return acc, f1, auroc
+        return self._compute_metrics(
+            accumulate=self.metric_protocol == "official_stateful_no_reset"
+        )
 
     def calculate_risks(self):
         # calculation based source test data
@@ -287,12 +359,21 @@ class AbstractTrainer(object):
 
     def add_mean_std_table(self, table, columns):
         # Calculate average and standard deviation for metrics
-        avg_metrics = [table[metric].mean() for metric in columns[2:]]
-        std_metrics = [table[metric].std() for metric in columns[2:]]
+        numeric_series = {}
+        for metric in columns[2:]:
+            converted = pd.to_numeric(table[metric], errors="coerce")
+            if converted.notna().any():
+                numeric_series[metric] = converted
+        avg_values = {metric: values.mean() for metric, values in numeric_series.items()}
+        std_values = {metric: values.std() for metric, values in numeric_series.items()}
 
         # Create dataframes for mean and std values
-        mean_metrics_df = pd.DataFrame([['mean', '-', *avg_metrics]], columns=columns)
-        std_metrics_df = pd.DataFrame([['std', '-', *std_metrics]], columns=columns)
+        mean_row = {column: "" for column in columns}
+        std_row = {column: "" for column in columns}
+        mean_row.update({columns[0]: "mean", columns[1]: "-", **avg_values})
+        std_row.update({columns[0]: "std", columns[1]: "-", **std_values})
+        mean_metrics_df = pd.DataFrame([mean_row], columns=columns)
+        std_metrics_df = pd.DataFrame([std_row], columns=columns)
 
         # Concatenate original dataframes with mean and std dataframes
         table = pd.concat([table, mean_metrics_df, std_metrics_df], ignore_index=True)

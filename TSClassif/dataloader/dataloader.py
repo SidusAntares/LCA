@@ -1,13 +1,10 @@
 import torch
-from torch.utils.data import DataLoader
 from torch.utils.data import Dataset
 from torchvision import transforms
-
-from sklearn.model_selection import train_test_split
-
-import os, sys
+import os
 import numpy as np
-import random
+
+from compat import load_torch_file
 
 
 class Load_Dataset(Dataset):
@@ -50,7 +47,9 @@ class Load_Dataset(Dataset):
     def __getitem__(self, index):
         x = self.x_data[index]
         if self.transform:
-            x = self.transform(self.x_data[index].reshape(self.num_channels, -1, 1)).reshape(self.x_data[index].shape)
+            x = self.transform(
+                self.x_data[index].reshape(self.num_channels, -1, 1)
+            ).reshape(self.x_data[index].shape)
         y = self.y_data[index] if self.y_data is not None else None
         return x, y
 
@@ -60,7 +59,7 @@ class Load_Dataset(Dataset):
 
 def data_generator(data_path, domain_id, dataset_configs, hparams, dtype):
     # loading dataset file from path
-    dataset_file = torch.load(os.path.join(data_path, f"{dtype}_{domain_id}.pt"))
+    dataset_file = load_torch_file(os.path.join(data_path, f"{dtype}_{domain_id}.pt"))
 
     # Loading datasets
     dataset = Load_Dataset(dataset_file, dataset_configs)
@@ -85,8 +84,8 @@ def data_generator(data_path, domain_id, dataset_configs, hparams, dtype):
 
 def data_generator_old(data_path, domain_id, dataset_configs, hparams):
     # loading path
-    train_dataset = torch.load(os.path.join(data_path, "train_" + domain_id + ".pt"))
-    test_dataset = torch.load(os.path.join(data_path, "test_" + domain_id + ".pt"))
+    train_dataset = load_torch_file(os.path.join(data_path, "train_" + domain_id + ".pt"))
+    test_dataset = load_torch_file(os.path.join(data_path, "test_" + domain_id + ".pt"))
 
     # Loading datasets
     train_dataset = Load_Dataset(train_dataset, dataset_configs)

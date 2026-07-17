@@ -68,12 +68,16 @@ class LCA(torch.nn.Module):
             weight_decay=1e-4
         )
 
-    def update(self, src_loader, trg_loader, avg_meter, logger, value_method):
+    def update(self, src_loader, trg_loader, avg_meter, logger, value_method,
+               training_protocol):
         # defining best and last model
         best_src_risk = float('inf')
         best_model = None
+        best_epoch = None
 
         for epoch in range(1, self.hparams["num_epochs"] + 1):
+            if training_protocol == "baseline_clean_protocol":
+                self.train()
 
             # training loop
             self.training_epoch(src_loader, trg_loader, avg_meter, epoch)
@@ -82,15 +86,21 @@ class LCA(torch.nn.Module):
             if (epoch + 1) % 10 == 0 and avg_meter['Src_cls_loss'].avg < best_src_risk:
                 best_src_risk = avg_meter['Src_cls_loss'].avg
                 best_model = deepcopy(self.state_dict())
+                best_epoch = epoch
 
             logger.debug(f'[Epoch : {epoch}/{self.hparams["num_epochs"]}]')
             for key, val in avg_meter.items():
                 logger.debug(f'{key}\t: {val.avg:2.4f}')
-            metic = value_method(is_train=False)[1]
-            logger.debug(f'trg_value f1 is {metic}')
+            if training_protocol == "paper_code_protocol":
+                metric = value_method(is_train=False)[1]
+                logger.debug(f'trg_value f1 is {metric}')
+            elif training_protocol != "baseline_clean_protocol":
+                raise ValueError(f"unknown training protocol: {training_protocol}")
             logger.debug(f'-------------------------------------')
 
         last_model = self.state_dict()
+        self.best_epoch = best_epoch
+        self.last_epoch = self.hparams["num_epochs"]
 
         return last_model, best_model
 
@@ -115,7 +125,8 @@ class LCA(torch.nn.Module):
             loss = (
                     class_loss * self.config.class_weight + rec_loss * self.config.rec_weight + sparsity_loss * self.config.sparsity_weight
                     + kld_loss * self.config.z_kl_weight + structure_loss * self.config.structure_weight)
-            losses = {"total_loss": loss.item(), "Src_cls_loss": class_loss.item(), "rec_loss": rec_loss.item(),
+            losses = {"total_loss": loss.item(), "Src_cls_loss": class_loss.item(),
+                      "rec_loss": rec_loss.item(),
                       "sparsity_loss": sparsity_loss.item(), "structure_loss": structure_loss.item(),
                       "kld_loss": kld_loss.item()}
             # losses = {"total_loss": loss.item(), "Src_cls_loss": loss.item()}
@@ -152,7 +163,7 @@ class LCA(torch.nn.Module):
         # pred=self.d_classifier(x.reshape(x.size(0), -1))
         # return None,None,pred
 
-        return (z_mean, z_std, z_std), rec_x, pred
+        return (z_mean, z_std, z), rec_x, pred
 
     #
     def __reparametrize(self, mu, logvar):

@@ -1,0 +1,54 @@
+# Code state before UCIHAR Table 5 reproduction work
+
+Captured: 2026-07-17 (Asia/Shanghai)
+
+## git status --short
+
+```text
+ M .gitignore
+ M TSClassif/algorithms/algorithms.py
+ M TSClassif/dataloader/dataloader.py
+ M TSClassif/run.py
+ M TSClassif/scripts/HAR.sh
+ M TSClassif/trainers/abstract_trainer.py
+ M TSClassif/trainers/train.py
+?? TSClassif/compat.py
+?? TSClassif/run_config.py
+?? TSClassif/scripts/run_HAR_4gpu.sh
+?? TSClassif/tests/
+?? TSClassif/tools/
+?? docs/
+?? findings.md
+?? progress.md
+?? sync_to_server.sh
+?? task_plan.md
+```
+
+## git rev-parse HEAD
+
+```text
+45c091fca909ac13675c6ddac7e0464f0a186355
+```
+
+## git log -5 --oneline
+
+```text
+45c091f Update Install.md
+4b37481 Update readme.md
+f998d9b Update Install.md
+3be362d Update .gitignore
+7b822af first commit
+```
+
+## git diff --stat
+
+```text
+ .gitignore                             |   4 +-
+ TSClassif/algorithms/algorithms.py     |  28 ++++--
+ TSClassif/dataloader/dataloader.py     |  40 +++-----
+ TSClassif/run.py                       |   8 ++
+ TSClassif/scripts/HAR.sh               |   4 +-
+ TSClassif/trainers/abstract_trainer.py | 109 +++++++++++++++------
+ TSClassif/trainers/train.py            | 171 +++++++++++++++++++++++++--------
+ 7 files changed, 259 insertions(+), 105 deletions(-)
+```

@@ -1,0 +1,631 @@
+diff --git a/.gitignore b/.gitignore
+index 7d8accc..aaf61fc 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,3 +1,5 @@
+ .DS_Store
+ .idea
+-.gitignore
+\ No newline at end of file
++.gitignore
++__pycache__/
++*.py[cod]
+diff --git a/TSClassif/algorithms/algorithms.py b/TSClassif/algorithms/algorithms.py
+index 74adb1b..0012c74 100644
+--- a/TSClassif/algorithms/algorithms.py
++++ b/TSClassif/algorithms/algorithms.py
+@@ -68,7 +68,8 @@ class LCA(torch.nn.Module):
+             weight_decay=1e-4
+         )
+ 
+-    def update(self, src_loader, trg_loader, avg_meter, logger, value_method):
++    def update(self, src_loader, trg_loader, avg_meter, logger, value_method=None,
++               eval_target_during_train=False):
+         # defining best and last model
+         best_src_risk = float('inf')
+         best_model = None
+@@ -79,18 +80,27 @@ class LCA(torch.nn.Module):
+             self.training_epoch(src_loader, trg_loader, avg_meter, epoch)
+ 
+             # saving the best model based on src risk
+-            if (epoch + 1) % 10 == 0 and avg_meter['Src_cls_loss'].avg < best_src_risk:
+-                best_src_risk = avg_meter['Src_cls_loss'].avg
++            if (epoch + 1) % 10 == 0 and avg_meter['Src_selection_loss'].avg < best_src_risk:
++                best_src_risk = avg_meter['Src_selection_loss'].avg
+                 best_model = deepcopy(self.state_dict())
+ 
+             logger.debug(f'[Epoch : {epoch}/{self.hparams["num_epochs"]}]')
+             for key, val in avg_meter.items():
+                 logger.debug(f'{key}\t: {val.avg:2.4f}')
+-            metic = value_method(is_train=False)[1]
+-            logger.debug(f'trg_value f1 is {metic}')
++            if eval_target_during_train:
++                if value_method is None:
++                    raise ValueError("target evaluation requested without an evaluation callback")
++                metric = value_method(is_train=False)[1]
++                logger.debug(f'trg_value f1 is {metric}')
++                self.train()
+             logger.debug(f'-------------------------------------')
+ 
+-        last_model = self.state_dict()
++        last_model = deepcopy(self.state_dict())
++        if best_model is None:
++            # Short debug runs may finish before the official 10-epoch cadence.
++            # With no selection opportunity, the sole/last source-trained state
++            # is the only valid source-only checkpoint candidate.
++            best_model = deepcopy(last_model)
+ 
+         return last_model, best_model
+ 
+@@ -105,6 +115,7 @@ class LCA(torch.nn.Module):
+ 
+             (src_z_mean, src_z_std, src_z), src_rec, src_pred_class = self.get_features(src_x)
+             (tgt_z_mean, tgt_z_std, tgt_z), tgt_rec, tgt_pred_class = self.get_features(trg_x)
++            source_selection_loss = self.cross_entropy(src_pred_class, src_y)
+             class_loss, rec_loss, sparsity_loss, kld_loss, structure_loss \
+                 = self.__loss_function(src_z_mean, src_z_std, src_z, src_x, src_rec, src_pred_class,
+                                        tgt_z_mean, tgt_z_std, tgt_z, trg_x, tgt_rec, tgt_pred_class, src_y,
+@@ -115,7 +126,8 @@ class LCA(torch.nn.Module):
+             loss = (
+                     class_loss * self.config.class_weight + rec_loss * self.config.rec_weight + sparsity_loss * self.config.sparsity_weight
+                     + kld_loss * self.config.z_kl_weight + structure_loss * self.config.structure_weight)
+-            losses = {"total_loss": loss.item(), "Src_cls_loss": class_loss.item(), "rec_loss": rec_loss.item(),
++            losses = {"total_loss": loss.item(), "Src_cls_loss": class_loss.item(),
++                      "Src_selection_loss": source_selection_loss.item(), "rec_loss": rec_loss.item(),
+                       "sparsity_loss": sparsity_loss.item(), "structure_loss": structure_loss.item(),
+                       "kld_loss": kld_loss.item()}
+             # losses = {"total_loss": loss.item(), "Src_cls_loss": loss.item()}
+@@ -152,7 +164,7 @@ class LCA(torch.nn.Module):
+         # pred=self.d_classifier(x.reshape(x.size(0), -1))
+         # return None,None,pred
+ 
+-        return (z_mean, z_std, z_std), rec_x, pred
++        return (z_mean, z_std, z), rec_x, pred
+ 
+     #
+     def __reparametrize(self, mu, logvar):
+diff --git a/TSClassif/dataloader/dataloader.py b/TSClassif/dataloader/dataloader.py
+index e32c286..953b406 100644
+--- a/TSClassif/dataloader/dataloader.py
++++ b/TSClassif/dataloader/dataloader.py
+@@ -1,13 +1,9 @@
+-import torch
+-from torch.utils.data import DataLoader
+-from torch.utils.data import Dataset
+-from torchvision import transforms
+-
+-from sklearn.model_selection import train_test_split
+-
+-import os, sys
+-import numpy as np
+-import random
++import torch
++from torch.utils.data import Dataset
++import os
++import numpy as np
++
++from compat import load_torch_file, normalize_channels
+ 
+ 
+ class Load_Dataset(Dataset):
+@@ -35,23 +31,17 @@ class Load_Dataset(Dataset):
+         elif len(x_data.shape) == 3 and x_data.shape[1] != self.num_channels:
+             x_data = x_data.transpose(1, 2)
+ 
+-        # Normalize data
+-        if dataset_configs.normalize:
+-            data_mean = torch.mean(x_data, dim=(0, 2))
+-            data_std = torch.std(x_data, dim=(0, 2))
+-            self.transform = transforms.Normalize(mean=data_mean, std=data_std)
+-        else:
+-            self.transform = None
+-        self.x_data = x_data.float()
++        # Normalize data
++        if dataset_configs.normalize:
++            x_data = normalize_channels(x_data.float())
++        self.x_data = x_data.float()
+         self.y_data = y_data.long() if y_data is not None else None
+         self.len = x_data.shape[0]
+          
+ 
+     def __getitem__(self, index):
+-        x = self.x_data[index]
+-        if self.transform:
+-            x = self.transform(self.x_data[index].reshape(self.num_channels, -1, 1)).reshape(self.x_data[index].shape)
+-        y = self.y_data[index] if self.y_data is not None else None
++        x = self.x_data[index]
++        y = self.y_data[index] if self.y_data is not None else None
+         return x, y
+ 
+     def __len__(self):
+@@ -60,7 +50,7 @@ class Load_Dataset(Dataset):
+ 
+ def data_generator(data_path, domain_id, dataset_configs, hparams, dtype):
+     # loading dataset file from path
+-    dataset_file = torch.load(os.path.join(data_path, f"{dtype}_{domain_id}.pt"))
++    dataset_file = load_torch_file(os.path.join(data_path, f"{dtype}_{domain_id}.pt"))
+ 
+     # Loading datasets
+     dataset = Load_Dataset(dataset_file, dataset_configs)
+@@ -85,8 +75,8 @@ def data_generator(data_path, domain_id, dataset_configs, hparams, dtype):
+ 
+ def data_generator_old(data_path, domain_id, dataset_configs, hparams):
+     # loading path
+-    train_dataset = torch.load(os.path.join(data_path, "train_" + domain_id + ".pt"))
+-    test_dataset = torch.load(os.path.join(data_path, "test_" + domain_id + ".pt"))
++    train_dataset = load_torch_file(os.path.join(data_path, "train_" + domain_id + ".pt"))
++    test_dataset = load_torch_file(os.path.join(data_path, "test_" + domain_id + ".pt"))
+ 
+     # Loading datasets
+     train_dataset = Load_Dataset(train_dataset, dataset_configs)
+diff --git a/TSClassif/run.py b/TSClassif/run.py
+index 9c7ae1d..9fa1893 100644
+--- a/TSClassif/run.py
++++ b/TSClassif/run.py
+@@ -27,6 +27,14 @@ if __name__ == "__main__":
+ 
+     # ========= Experiment settings ===============
+     parser.add_argument('--num_runs', default=1, type=int, help='Number of consecutive run with different seeds')
++    parser.add_argument('--run_ids', default=None, type=str,
++                        help='Comma-separated run IDs; defaults to range(num_runs)')
++    parser.add_argument('--scenario', default=None, type=str,
++                        help='Run one scenario as SRC,TGT; defaults to all official scenarios')
++    parser.add_argument('--num_epochs', default=None, type=int,
++                        help='Override the dataset default epoch count')
++    parser.add_argument('--eval_target_during_train', action='store_true',
++                        help='Reproduce official per-epoch target evaluation (disabled by default)')
+     parser.add_argument('--device', default="cuda:0", type=str, help='cpu or cuda')
+ 
+     # arguments
+diff --git a/TSClassif/scripts/HAR.sh b/TSClassif/scripts/HAR.sh
+index 46e5ccd..9b09ede 100644
+--- a/TSClassif/scripts/HAR.sh
++++ b/TSClassif/scripts/HAR.sh
+@@ -1,3 +1,5 @@
+ #!/bin/bash
+ 
+-python run.py  --save_dir LCA_all_result --exp_name HAR_type1 --da_method LCA --dataset HAR --num_run 3  --type type1 --lr 0.001
+\ No newline at end of file
++python run.py --phase train --save_dir LCA_all_result --exp_name HAR_type1 \
++  --da_method LCA --dataset HAR --data_path dataset --num_runs 3 \
++  --type type1 --lr 0.001 --device cuda:0
+diff --git a/TSClassif/trainers/abstract_trainer.py b/TSClassif/trainers/abstract_trainer.py
+index 4f663f6..8bc46ec 100644
+--- a/TSClassif/trainers/abstract_trainer.py
++++ b/TSClassif/trainers/abstract_trainer.py
+@@ -3,22 +3,26 @@ import sys
+ sys.path.append('../../ADATIME/')
+ import torch
+ import torch.nn.functional as F
+-from torchmetrics import Accuracy, AUROC, F1Score
+ import os
+-import wandb
+ import pandas as pd
+ import numpy as np
+ import warnings
+ import sklearn.exceptions
+-import collections
++from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
+ 
+-from torchmetrics import Accuracy, AUROC, F1Score
++try:
++    import wandb
++except ImportError:  # wandb is not required by the local training flow.
++    wandb = None
++
++from compat import load_torch_file
+ from dataloader.dataloader import data_generator, few_shot_data_generator
+ from configs.data_model_configs import get_dataset_class
+ from configs.hparams import get_hparams_class
+ from utils import fix_randomness, starting_logs, DictAsObject, AverageMeter
+ from algorithms.algorithms import get_algorithm_class, LCA
+ from models.models import get_backbone_class
++from run_config import parse_scenario, resolve_run_ids
+ 
+ warnings.filterwarnings("ignore", category=sklearn.exceptions.UndefinedMetricWarning)
+ 
+@@ -49,6 +53,7 @@ class AbstractTrainer(object):
+ 
+         # Specify runs
+         self.num_runs = args.num_runs
++        self.run_ids = resolve_run_ids(args.run_ids, args.num_runs)
+ 
+         # get dataset and base model configs
+         self.dataset_configs, self.hparams_class = self.get_configs()
+@@ -60,12 +65,15 @@ class AbstractTrainer(object):
+ 
+         self.hparams = {**self.hparams_class.alg_hparams[self.da_method],
+                         **self.hparams_class.train_params}
++        if args.num_epochs is not None:
++            if args.num_epochs < 1:
++                raise ValueError("--num_epochs must be at least 1")
++            self.hparams["num_epochs"] = args.num_epochs
++        if args.scenario is not None:
++            self.dataset_configs.scenarios = parse_scenario(args.scenario)
+ 
+         # metrics
+         self.num_classes = self.dataset_configs.num_classes
+-        self.ACC = Accuracy(task="multiclass", num_classes=self.num_classes)
+-        self.F1 = F1Score(task="multiclass", num_classes=self.num_classes, average="macro")
+-        self.AUROC = AUROC(task="multiclass", num_classes=self.num_classes)
+         self.args = args
+ 
+         # metrics
+@@ -88,7 +96,7 @@ class AbstractTrainer(object):
+         self.algorithm.to(self.device)
+ 
+     def load_checkpoint(self, model_dir):
+-        checkpoint = torch.load(os.path.join(self.home_path, model_dir, 'checkpoint.pt'))
++        checkpoint = load_torch_file(os.path.join(self.home_path, model_dir, 'checkpoint.pt'))
+         last_model = checkpoint['last']
+         best_model = checkpoint['best']
+         return last_model, best_model
+@@ -154,15 +162,55 @@ class AbstractTrainer(object):
+         hparams_class = get_hparams_class(self.dataset)
+         return dataset_class(), hparams_class()
+ 
+-    def load_data(self, src_id, trg_id):
++    def load_data(self, src_id, trg_id, include_target_test=False):
+         self.src_train_dl = data_generator(self.data_path, src_id, self.dataset_configs, self.hparams, "train")
+         self.src_test_dl = data_generator(self.data_path, src_id, self.dataset_configs, self.hparams, "test")
+ 
+         self.trg_train_dl = data_generator(self.data_path, trg_id, self.dataset_configs, self.hparams, "train")
+-        self.trg_test_dl = data_generator(self.data_path, trg_id, self.dataset_configs, self.hparams, "test")
++        self.trg_test_dl = None
++        self.few_shot_dl_5 = None
++        if include_target_test:
++            self.load_target_evaluation_data(trg_id)
+ 
+-        self.few_shot_dl_5 = few_shot_data_generator(self.trg_test_dl, self.dataset_configs,
+-                                                     5)  # set 5 to other value if you want other k-shot FST
++    def load_target_evaluation_data(self, trg_id):
++        """Load target test labels only after training (or explicitly for test phase)."""
++        self.trg_test_dl = data_generator(self.data_path, trg_id, self.dataset_configs, self.hparams, "test")
++        self.few_shot_dl_5 = few_shot_data_generator(
++            self.trg_test_dl, self.dataset_configs, 5
++        )
++
++    def _compute_metrics(self):
++        scores = self.full_preds.detach().cpu().numpy()
++        labels = self.full_labels.detach().cpu().numpy()
++        predicted = scores.argmax(axis=1)
++        acc = accuracy_score(labels, predicted)
++        f1 = f1_score(
++            labels,
++            predicted,
++            average="macro",
++            labels=list(range(self.num_classes)),
++            zero_division=0,
++        )
++        missing = sorted(set(range(self.num_classes)) - set(np.unique(labels).tolist()))
++        if missing:
++            warnings.warn(
++                f"AUROC is undefined because evaluation labels omit classes {missing}; returning NaN",
++                RuntimeWarning,
++            )
++            auroc = float("nan")
++        else:
++            try:
++                auroc = roc_auc_score(
++                    labels,
++                    scores,
++                    labels=list(range(self.num_classes)),
++                    multi_class="ovr",
++                    average="macro",
++                )
++            except ValueError as exc:
++                warnings.warn(f"AUROC could not be computed ({exc}); returning NaN", RuntimeWarning)
++                auroc = float("nan")
++        return acc, f1, auroc
+ 
+     def create_save_dir(self, save_dir):
+         if not os.path.exists(save_dir):
+@@ -180,12 +228,7 @@ class AbstractTrainer(object):
+         trg_risk = self.loss.item()
+ 
+         # calculate metrics
+-        acc = self.ACC(self.full_preds.argmax(dim=1).cpu(), self.full_labels.cpu()).item()
+-        # f1_torch
+-        f1 = self.F1(self.full_preds.argmax(dim=1).cpu(), self.full_labels.cpu()).item()
+-        auroc = self.AUROC(self.full_preds.cpu(), self.full_labels.cpu()).item()
+-        # f1_sk learn
+-        # f1 = f1_score(self.full_preds.argmax(dim=1).cpu().numpy(), self.full_labels.cpu().numpy(), average='macro')
++        acc, f1, auroc = self._compute_metrics()
+ 
+         risks = src_risk, fst_risk, trg_risk
+         metrics = acc, f1, auroc
+@@ -194,7 +237,7 @@ class AbstractTrainer(object):
+ 
+     def save_tables_to_file(self, table_results, name):
+         # save to file if needed
+-        table_results.to_csv(os.path.join(self.exp_log_dir, f"{name}.csv"))
++        table_results.to_csv(os.path.join(self.exp_log_dir, f"{name}.csv"), index=False)
+ 
+     def save_checkpoint(self, home_path, log_dir, last_model, best_model):
+         save_dict = {
+@@ -239,6 +282,8 @@ class AbstractTrainer(object):
+ 
+     def wandb_logging(self, total_results, total_risks, summary_metrics, summary_risks):
+         # log wandb
++        if wandb is None:
++            raise RuntimeError("wandb is not installed; local training does not require wandb logging")
+         wandb.log({'results': total_results})
+         wandb.log({'risks': total_risks})
+         wandb.log({'hparams': wandb.Table(
+@@ -250,14 +295,7 @@ class AbstractTrainer(object):
+     def calculate_metrics(self, is_train=True):
+ 
+         self.evaluate(self.trg_test_dl, is_train)
+-        # accuracy  
+-        acc = self.ACC(self.full_preds.argmax(dim=1).cpu(), self.full_labels.cpu()).item()
+-        # f1
+-        f1 = self.F1(self.full_preds.argmax(dim=1).cpu(), self.full_labels.cpu()).item()
+-        # auroc 
+-        auroc = self.AUROC(self.full_preds.cpu(), self.full_labels.cpu()).item()
+-
+-        return acc, f1, auroc
++        return self._compute_metrics()
+ 
+     def calculate_risks(self):
+         # calculation based source test data
+@@ -287,12 +325,21 @@ class AbstractTrainer(object):
+ 
+     def add_mean_std_table(self, table, columns):
+         # Calculate average and standard deviation for metrics
+-        avg_metrics = [table[metric].mean() for metric in columns[2:]]
+-        std_metrics = [table[metric].std() for metric in columns[2:]]
++        numeric_series = {}
++        for metric in columns[2:]:
++            converted = pd.to_numeric(table[metric], errors="coerce")
++            if converted.notna().any():
++                numeric_series[metric] = converted
++        avg_values = {metric: values.mean() for metric, values in numeric_series.items()}
++        std_values = {metric: values.std() for metric, values in numeric_series.items()}
+ 
+         # Create dataframes for mean and std values
+-        mean_metrics_df = pd.DataFrame([['mean', '-', *avg_metrics]], columns=columns)
+-        std_metrics_df = pd.DataFrame([['std', '-', *std_metrics]], columns=columns)
++        mean_row = {column: "" for column in columns}
++        std_row = {column: "" for column in columns}
++        mean_row.update({columns[0]: "mean", columns[1]: "-", **avg_values})
++        std_row.update({columns[0]: "std", columns[1]: "-", **std_values})
++        mean_metrics_df = pd.DataFrame([mean_row], columns=columns)
++        std_metrics_df = pd.DataFrame([std_row], columns=columns)
+ 
+         # Concatenate original dataframes with mean and std dataframes
+         table = pd.concat([table, mean_metrics_df, std_metrics_df], ignore_index=True)
+diff --git a/TSClassif/trainers/train.py b/TSClassif/trainers/train.py
+index d59794c..e238d65 100644
+--- a/TSClassif/trainers/train.py
++++ b/TSClassif/trainers/train.py
+@@ -1,13 +1,12 @@
+ import sys
+-
++import json
++import platform
++import subprocess
++import time
+ import torch
+-import torch.nn.functional as F
+ import os
+-import wandb
+ import pandas as pd
+ import numpy as np
+-import warnings
+-import sklearn.exceptions
+ import collections
+ import argparse
+ import warnings
+@@ -32,20 +31,77 @@ class Trainer(AbstractTrainer):
+     def __init__(self, args):
+         super().__init__(args)
+ 
+-        self.results_columns = ["scenario", "run", "acc", "f1_score", "auroc"]
++        self.results_columns = [
++            "scenario", "run", "acc", "f1_score", "auroc", "status",
++            "runtime_seconds", "peak_gpu_memory_mb", "checkpoint_path",
++            "git_commit", "python_version", "torch_version", "cuda_version",
++        ]
++        self.evaluation_columns = ["scenario", "run", "acc", "f1_score", "auroc"]
+         self.risks_columns = ["scenario", "run", "src_risk", "few_shot_risk", "trg_risk"]
+ 
++    def _git_commit(self):
++        try:
++            return subprocess.check_output(
++                ["git", "rev-parse", "HEAD"], cwd=self.home_path, text=True
++            ).strip()
++        except (OSError, subprocess.SubprocessError):
++            return "unknown"
++
++    def _record_failure(self, src_id, trg_id, run_id, exc):
++        failure = {
++            "scenario": f"{src_id}_to_{trg_id}",
++            "run": run_id,
++            "exception_type": type(exc).__name__,
++            "message": str(exc),
++            "traceback": traceback.format_exc(),
++        }
++        failure_path = os.path.join(self.exp_log_dir, "failed_runs.jsonl")
++        with open(failure_path, "a", encoding="utf-8") as handle:
++            handle.write(json.dumps(failure, ensure_ascii=False) + "\n")
++        return failure
++
++    def _load_existing_table(self, name, columns):
++        path = os.path.join(self.exp_log_dir, f"{name}.csv")
++        if not os.path.isfile(path):
++            return pd.DataFrame(columns=columns)
++        table = pd.read_csv(path)
++        if not set(columns).issubset(table.columns):
++            return pd.DataFrame(columns=columns)
++        # Summary rows are regenerated after real run rows are updated.
++        table = table[~table["scenario"].astype(str).isin(["mean", "std"])]
++        table = table[~table["run"].astype(str).isin(["mean", "std", "-"])]
++        return table[columns]
++
++    def _run_complete(self, table_results, src_id, trg_id, run_id):
++        scenario = f"{src_id}_to_{trg_id}"
++        rows = table_results[
++            (table_results["scenario"].astype(str) == scenario)
++            & (table_results["run"].astype(str) == str(run_id))
++            & (table_results["status"].astype(str) == "success")
++        ]
++        if rows.empty:
++            return False
++        log_dir = os.path.join(self.exp_log_dir, f"{scenario}_run_{run_id}")
++        try:
++            last_model, best_model = self.load_checkpoint(log_dir)
++            return last_model is not None and best_model is not None
++        except Exception:
++            return False
++
+     def fit(self):
+ 
+         # table with metrics
+-        table_results = pd.DataFrame(columns=self.results_columns)
++        table_results = self._load_existing_table('results', self.results_columns)
+ 
+         # table with risks
+-        table_risks = pd.DataFrame(columns=self.risks_columns)
++        table_risks = self._load_existing_table('risks', self.risks_columns)
+ 
+         # Trainer
+         for src_id, trg_id in self.dataset_configs.scenarios:
+-            for run_id in range(self.num_runs):
++            for run_id in self.run_ids:
++                if self._run_complete(table_results, src_id, trg_id, run_id):
++                    print(f"skip complete run {src_id}->{trg_id} run={run_id}")
++                    continue
+                 # fixing random seed
+                 fix_randomness(run_id)
+ 
+@@ -55,33 +111,70 @@ class Trainer(AbstractTrainer):
+                 # Average meters
+                 self.loss_avg_meters = collections.defaultdict(lambda: AverageMeter())
+ 
+-                # Load data
+-                self.load_data(src_id, trg_id)
+-
+-                # initiate the domain adaptation algorithm
+-                self.initialize_algorithm()
+-
+-                # Train the domain adaptation algorithm
+-
+-
+                 try:
++                    started_at = time.perf_counter()
++                    if self.device.type == "cuda":
++                        # PyTorch 2.3 can reject a torch.device passed to the
++                        # memory API before the CUDA context has been selected.
++                        torch.cuda.set_device(self.device)
++                        torch.cuda.reset_peak_memory_stats()
++
++                    # Target test labels are loaded here only when explicitly
++                    # reproducing the official per-epoch target evaluation.
++                    self.load_data(
++                        src_id,
++                        trg_id,
++                        include_target_test=self.args.eval_target_during_train,
++                    )
++                    self.initialize_algorithm()
+                     self.last_model, self.best_model = self.algorithm.update(self.src_train_dl, self.trg_train_dl,
+-                                                                             self.loss_avg_meters, self.logger,self.calculate_metrics)
++                                                                             self.loss_avg_meters, self.logger,
++                                                                             self.calculate_metrics,
++                                                                             self.args.eval_target_during_train)
++
++                    # Save only after update completed successfully.
++                    self.save_checkpoint(self.home_path, self.scenario_log_dir,
++                                         self.last_model, self.best_model)
++
++                    # The one and only default target-test evaluation happens
++                    # after training and checkpoint selection have finished.
++                    if self.trg_test_dl is None:
++                        self.load_target_evaluation_data(trg_id)
++                    metrics = self.calculate_metrics()
++                    risks = self.calculate_risks()
++                    runtime_seconds = time.perf_counter() - started_at
++                    peak_gpu_memory_mb = (
++                        torch.cuda.max_memory_allocated(self.device) / (1024 ** 2)
++                        if self.device.type == "cuda" else 0.0
++                    )
++
++                    scenario = f"{src_id}_to_{trg_id}"
++                    checkpoint_path = os.path.abspath(
++                        os.path.join(self.scenario_log_dir, "checkpoint.pt")
++                    )
++                    result_values = (
++                        *metrics,
++                        "success",
++                        runtime_seconds,
++                        peak_gpu_memory_mb,
++                        checkpoint_path,
++                        self._git_commit(),
++                        platform.python_version(),
++                        torch.__version__,
++                        torch.version.cuda or "none",
++                    )
++                    table_results = self.append_results_to_tables(
++                        table_results, scenario, run_id, result_values
++                    )
++                    table_risks = self.append_results_to_tables(
++                        table_risks, scenario, run_id, risks
++                    )
++                    self.save_tables_to_file(table_results, 'results')
++                    self.save_tables_to_file(table_risks, 'risks')
+                 except Exception as e:
+-                    print(f"An error occurred: {str(e)}")
+-                    traceback.print_exc()
+-
+-                # Save checkpoint
+-                self.save_checkpoint(self.home_path, self.scenario_log_dir, self.last_model, self.best_model)
+-
+-                # Calculate risks and metrics
+-                metrics = self.calculate_metrics()
+-                risks = self.calculate_risks()
+-
+-                # Append results to tables
+-                scenario = f"{src_id}_to_{trg_id}"
+-                table_results = self.append_results_to_tables(table_results, scenario, run_id, metrics)
+-                table_risks = self.append_results_to_tables(table_risks, scenario, run_id, risks)
++                    failure = self._record_failure(src_id, trg_id, run_id, e)
++                    print(failure["traceback"], file=sys.stderr)
++                    raise
+         print(table_results)
+         # Calculate and append mean and std to tables
+         table_results = self.add_mean_std_table(table_results, self.results_columns)
+@@ -93,12 +186,12 @@ class Trainer(AbstractTrainer):
+ 
+     def test(self):
+         # Results dataframes
+-        last_results = pd.DataFrame(columns=self.results_columns)
+-        best_results = pd.DataFrame(columns=self.results_columns)
++        last_results = pd.DataFrame(columns=self.evaluation_columns)
++        best_results = pd.DataFrame(columns=self.evaluation_columns)
+ 
+         # Cross-domain scenarios
+         for src_id, trg_id in self.dataset_configs.scenarios:
+-            for run_id in range(self.num_runs):
++            for run_id in self.run_ids:
+                 # fixing random seed
+                 fix_randomness(run_id)
+ 
+@@ -108,7 +201,7 @@ class Trainer(AbstractTrainer):
+                 self.loss_avg_meters = collections.defaultdict(lambda: AverageMeter())
+ 
+                 # Load data
+-                self.load_data(src_id, trg_id)
++                self.load_data(src_id, trg_id, include_target_test=True)
+ 
+                 # Build model
+                 self.initialize_algorithm()
+@@ -145,8 +238,8 @@ class Trainer(AbstractTrainer):
+         self.save_tables_to_file(best_scenario_mean_std, 'best_results')
+ 
+         # printing summary 
+-        summary_last = {metric: np.mean(last_results[metric]) for metric in self.results_columns[2:]}
+-        summary_best = {metric: np.mean(best_results[metric]) for metric in self.results_columns[2:]}
++        summary_last = {metric: np.mean(last_results[metric]) for metric in self.evaluation_columns[2:]}
++        summary_best = {metric: np.mean(best_results[metric]) for metric in self.evaluation_columns[2:]}
+         for summary_name, summary in [('Last', summary_last), ('Best', summary_best)]:
+             for key, val in summary.items():
+                 print(f'{summary_name}: {key}\t: {val:2.4f}')
